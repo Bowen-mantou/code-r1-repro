@@ -75,6 +75,7 @@
 | **hf-mirror 历史 commit 冷对象极慢** | `resolve/{commit}` 无 CDN 缓存 → 回源仅 ~60KB/s；`resolve/main` 有热缓存 371KB/s~31MB/s。**先 curl -sIL 对比 main 与目标 commit 的 Content-Length**，相同就用 main 下载 |
 | **aria2c 多连接下载**（2026-09-06 实测） | 单连接 371KB/s → `aria2c -x 16 -s 16 -k 1M` 后 4.5~31MB/s（10-80×）。**必带 `--file-allocation=falloc`**：`none` 造稀疏文件，失败分片留下 **NUL(0x00) 空洞**且文件大小仍"对"（JSON 在洞处报 Invalid control character）。**下完必须 sha256sum 对比 HF API `?blobs=true` 的 lfs.sha256**——大小一致 ≠ 内容完整 |
 | 评估脚本「坏行跳过」容错是危险的 | gen_lcb.py 的 try/except json.loads + continue 会**静默丢题改变口径**。数据必须校验通过；坏行应报错退出，不能跳过 |
+| **静默降级 vs 工程异常**（2026-09-07 收官教训）| watchdog/显存/磁盘检测抓的都是「会崩的异常」；verifier 信号链路断（fallback 静默回退）属于**静默降级**——不崩、分数不难看、无告警，潜伏两轮实验才暴露。防线：**每个信号源启动 smoke 打印实际值**（如 reward_fn 打印 extra_info 里的 verifier_score 样本）+ reward 成分分解统计（verifier 项恒 0 = 信号没进）+ 关键结论配第二证据链（不要靠运气起疑） |
 | **LCB 打分在 2GB 容器 OOM**（2026-09-06） | my_lcb_eval.py 一次加载 4.3GB 题目 + 16 进程 → OOM（exit 137 SIGKILL，日志 0 字节）。同进程分批 + gc 也救不回（codegen_metrics 内部对象累积）。**解法：每批独立进程**——split_lcb_shards.py 切 9 片 × 100 题 → my_lcb_eval_worker.py 每片一个 python 进程（进程退出=内存清零）→ run_lcb_score_shards.sh 串行驱动 + 加权合并 pass@1。口径与原脚本一致（shard 0/1 数字与同进程分批完全吻合）。9 片 ~9 分钟 |
 
 ## 六、通知与监控
