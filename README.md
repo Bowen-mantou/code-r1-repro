@@ -26,11 +26,11 @@ learned verifier 路线，veRL + Qwen2.5-Coder-3B，A800 双卡，~¥400 预算�
 
 ## 仓库结构
 
-- [TUTORIAL.md](TUTORIAL.md) — 完整复现教程（数据→训练→评估→verifier→门控蒸馏）
+- [tutorials/TUTORIAL.md](tutorials/TUTORIAL.md) — 完整复现教程（数据→训练→评估→verifier→门控蒸馏）
+- [tutorials/INTERVIEW-MASTER.md](tutorials/INTERVIEW-MASTER.md) — 面试弹药库（公式→代码→工程→设计 + 100 题问答 + 跨项目对比）
+- [tutorials/ENGINEERING-DEEP-DIVE.md](tutorials/ENGINEERING-DEEP-DIVE.md) — 工程深度（veRL 架构/显存账/监控体系）
+- [tutorials/CODE-WALKTHROUGH.md](tutorials/CODE-WALKTHROUGH.md) — 代码带读（逐文件逐段精读）
 - [REPORT.md](REPORT.md) — 最终报告（六模型全指标 + 结论修正 + 花费账）
-- [INTERVIEW-MASTER.md](INTERVIEW-MASTER.md) — 面试弹药库（公式→代码→工程→设计 + 100 题问答 + 跨项目对比）
-- [ENGINEERING-DEEP-DIVE.md](ENGINEERING-DEEP-DIVE.md) — 工程深度（veRL 架构/显存账/监控体系）
-- [CODE-WALKTHROUGH.md](CODE-WALKTHROUGH.md) — 代码带读（逐文件逐段精读）
 - [PITFALLS.md](PITFALLS.md) — 踩坑手册（15+ 条实战教训）
 - `papers/` — 7 篇关键论文中文摘要（GLM-5/SeqBeatsJoint/RG-OPD/SG-OPD 等）
 - `code/` — 训练与评估脚本、reward 函数、verifier 服务、patch 全集

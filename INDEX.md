@@ -2,15 +2,20 @@
 
 > 项目已完结（2026-09-07）。按用途选入口。
 
-## 核心文档（面试/展示用）
+## 教程（tutorials/，面试/学习核心）
 
 | 文档 | 用途 | 规模 |
 |------|------|------|
-| [INTERVIEW-MASTER.md](INTERVIEW-MASTER.md) | **面试弹药库**：公式→代码→工程→设计 + 100 题问答 + 跨项目对比 + 速查卡 | 9 章 |
-| [ENGINEERING-DEEP-DIVE.md](ENGINEERING-DEEP-DIVE.md) | **工程深度**：veRL 架构/显存账/监控体系/迁移清单 | 10 章 |
-| [CODE-WALKTHROUGH.md](CODE-WALKTHROUGH.md) | **代码带读**：逐文件逐段精读 + 自查清单 | 7 章 |
-| [2026-09-07-FINAL-REPORT.md](2026-09-07-FINAL-REPORT.md) | 最终报告：六模型全指标 + 5 条结论 + 花费账 | — |
-| [PITFALLS.md](PITFALLS.md) | 踩坑手册（15+ 条，后续实验必读）| — |
+| [tutorials/INTERVIEW-MASTER.md](tutorials/INTERVIEW-MASTER.md) | **面试弹药库**：公式→代码→工程→设计 + 100 题问答 + 跨项目对比 + 速查卡 | 9 章 |
+| [tutorials/ENGINEERING-DEEP-DIVE.md](tutorials/ENGINEERING-DEEP-DIVE.md) | **工程深度**：veRL 架构/显存账/监控体系/迁移清单 | 10 章 |
+| [tutorials/CODE-WALKTHROUGH.md](tutorials/CODE-WALKTHROUGH.md) | **代码带读**：逐文件逐段精读 + 自查清单 | 7 章 |
+
+## 核心文档
+
+| 文档 | 用途 |
+|------|------|
+| [2026-09-07-FINAL-REPORT.md](2026-09-07-FINAL-REPORT.md) | 最终报告：六模型全指标 + 5 条结论 + 花费账 |
+| [PITFALLS.md](PITFALLS.md) | 踩坑手册（15+ 条，后续实验必读）|
 
 ## 研究过程文档
 
