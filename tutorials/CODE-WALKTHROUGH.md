@@ -246,3 +246,144 @@ find "$CKPT_DIR" -maxdepth 1 -name 'global_step_*' -mmin +3 \
 - [ ] watchdog 三个时间常数（60s/30s/120s）各管什么
 - [ ] patch 三版的迭代逻辑（v1 崩 → v2 修 → v3 观测）
 - [ ] 能说出「如果重写，reward_fn 的 fallback 会改成 raise + smoke」
+
+---
+
+## 8. 沙箱与 harness 带读（执行模型生成代码的安全基建）
+
+### 8.1 为什么需要自建沙箱：firejail 的「静默降级」
+
+```
+容器内无 CAP_SYS_ADMIN → firejail 检测到"已存在沙箱" → 静默运行且不设防
+```
+这是本项目第二个「静默降级」实例（第一个是 verifier 链路）——**安全工具检测到环境
+不支持时选择"假装成功"而不是报错**。面试时点出这个 pattern 会非常加分。
+
+### 8.2 sandbox_exec.py 逐段精读（seccomp BPF 手写）
+
+```python
+BLOCKED_NRS = [41, 42, ..., 55]   # x86_64 socket 家族 syscall 号
+def build_filter():
+    f = [_f(0x20, 0, 0, 4),                    # LD W ABS 4：读 arch
+         _f(0x15, 1, 0, AUDIT_ARCH_X86_64),    # JEQ arch==x86_64 → skip（跳 1 到 next）
+         _f(0x06, 0, 0, SECCOMP_RET_KILL_PROCESS),  # 非 x86_64 → KILL
+         _f(0x20, 0, 0, 0)]                    # LD W ABS 0：读 syscall nr
+    for nr in BLOCKED_NRS:
+        f.append(_f(0x15, 0, 1, nr))           # JEQ nr==blocked → fall through（jf=0）
+        f.append(_f(0x06, 0, 0, SECCOMP_RET_ERRNO | 1))  # RET ERRNO(EPERM)
+    f.append(_f(0x06, 0, 0, SECCOMP_RET_ALLOW))
+```
+**带教点**：
+1. **seccomp 过滤器是 BPF 字节码**：LD（加载）/JEQ（条件跳）/RET（返回值）三条指令
+   构成一个线性程序，内核在每次 syscall 时执行。jt/jf 是「命中跳几格/不中跳几格」。
+2. **arch 检查必须第一**：不同架构 syscall 号不同——不检查的话 x86 的 41 号在 arm 上
+   是别的调用，堵错系统调用。安全代码的第一个 pattern：**先验身份再验行为**。
+3. 选择 **ERRNO(EPERM) 而非 KILL**：让模型代码看到「网络不可用」的正常错误（socket()
+   返回 EPERM），而不是进程暴毙——**可诊断性优于暴力**。
+
+```python
+def apply_seccomp():
+    libc.prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)   # 先 no_new_privs
+    libc.prctl(PR_SET_SECCOMP, 2, byref(fprog), 0, 0)  # SECCOMP_MODE_FILTER
+```
+**为什么 NO_NEW_PRIVS 必须在前**：否则代码可能通过 setuid 二进制提权后绕过 seccomp。
+顺序即语义：**先锁提权路径，再上过滤器**。
+
+```python
+def apply_rlimits():
+    RLIMIT_NPROC 32     # 防 fork 炸弹
+    RLIMIT_NOFILE 32    # 防 fd 耗尽
+    RLIMIT_FSIZE 2MB    # 防写盘
+    RLIMIT_AS 4GB       # 防内存炸弹
+    RLIMIT_CPU 30       # 防死循环——内核级 SIGXCPU，孙进程也逃不掉
+```
+**RLIMIT_CPU 是本设计最硬的一层**：它由内核强制（超时发 SIGXCPU 然后 SIGKILL），
+**与进程树无关**——用户态的 timeout+killpg 杀不到的孙进程，内核照样算它们的 CPU 时间。
+
+```python
+def drop_privs():
+    os.setgroups([])        # 清附加组（很多系统的漏洞点）
+    os.setgid(65534); os.setuid(65534)   # nobody
+def main():
+    apply_rlimits(); apply_seccomp(); drop_privs()
+    os.execvp(sys.argv[1], sys.argv[1:])   # 原子替换，无 fork 窗口期
+```
+**execvp 而非 fork+exec**：沙箱属性（rlimit/seccomp/uid）是进程属性，exec 后保留；
+fork 会多一个「未执行代码的窗口」。**一行 execvp 消灭一类 TOCTOU**。
+
+### 8.3 firejail_exec.py（harness 调用方）逐段精读
+
+```python
+proc = subprocess.Popen(command, ..., start_new_session=True)   # 新会话 = 新进程组
+try:
+    stdout, stderr = proc.communicate(input=..., timeout=timeout + 10)
+except subprocess.TimeoutExpired:
+    os.killpg(proc.pid, signal.SIGKILL)   # 杀整组——孙进程逃逸 bug 的修复
+    proc.kill()
+```
+**这个 bug 的完整故事**（面试必讲）：v1 用 `subprocess.run(timeout)`——它只 kill
+直接子进程；模型代码 `os.system()` spawn 的孙进程 hold 住 stdout 管道 →
+`communicate()` 永远阻塞 → **训练卡死 54 分钟**（不是崩，是死锁）。修复三件套：
+① `start_new_session=True`（子进程自成进程组）② `killpg`（整组杀）③ RLIMIT_CPU
+内核兜底（上面 8.2 的那层）。**「用户态超时杀不干净」→「进程组语义」→「内核兜底」
+三层递进**。
+
+```python
+if len(code) < CLI_ARG_SIZE_LIMIT:   # 3KB
+    command.extend(["python3", "-c", code])          # 短代码走 argv
+else:
+    ... NamedTemporaryFile 写入 → os.chmod(tmp, 0o644) → 执行文件
+```
+**为什么短代码走 -c**：省文件 I/O；**为什么 chmod 644**：执行时已 setuid nobody，
+临时文件必须对 nobody 可读（root 创建的临时文件默认 600）。**降权后每个资源都要
+检查访问权限**——这是 drop_privs 场景的第二类经典 bug。
+
+```python
+if pytest:   # LCB 风格：测试文件 + solution 文件分离
+    os.chmod(tmpdir, 0o777)   # nobody 需要写 pytest cache
+    ... python3 -m pytest -p no:cacheprovider -q tmpdir
+env["OPENBLAS_NUM_THREADS"] = "1"    # 防 BLAS 多线程抢 CPU
+del env["PYTHONPATH"]                # 隔离环境
+```
+**env 清洗的两个理由**：OPENBLAS 多线程会让 RLIMIT_CPU 的「30 秒」语义混乱
+（多核并行消耗 CPU 时间快 8 倍）；PYTHONPATH 污染会让模型代码 import 到训练环境的包。
+
+### 8.4 三个评测 harness 的调用链
+
+| 基准 | harness | 沙箱 | 口径 |
+|------|---------|------|------|
+| evalplus | 官方 `evalplus.evaluate`（base + plus 双测试集）| 官方自带 | 生成→sanitize→评估 |
+| LCB | 官方 `codegen_metrics`（16 进程、timeout 6s）| 官方自带 | 880 题同口径 |
+| CodeContests | 自写（`code_prm/exec_backends.exec_code`）| sandbox_exec | public+private+generated 全过才算对 |
+
+**关键坑**（PITFALLS #69）：evalplus 生成后直接评估 0 分——官方流程要求先
+**sanitize**（提取代码块、去 markdown 围栏）。评估 harness 的「预处理步骤」和
+「打分步骤」分开理解。
+
+### 8.5 沙箱设计的面试总结句
+
+「我的沙箱是**四层纵深**：seccomp 堵网络（可诊断的 EPERM 而非 KILL）、rlimit 限资源
+（CPU 由内核强制、逃逸不了）、setuid 降权（nobody + 清附加组）、进程组超时（用户态
+杀不干净的内核兜底）。每层都有对应的真实攻击场景，不是我拍脑袋加的。」
+
+---
+
+## 9. 实验回顾与复盘（哪些决定有意义，当时为什么，现在怎么看）
+
+> 完整版见 docs/EXPERIMENT-RETROSPECTIVE.md，这里是面试速记版。
+
+| 决策 | 当时理由 | 现在回看 |
+|------|---------|---------|
+| 2×2 矩阵 | 控制变量隔离信号类型 | ✅ 最有价值的决定——所有结论都来自「相邻格差一变量」 |
+| E1 跑 4ep 944 步 | 对齐论文口径 | ⚠️ 过训退化——但意外产出「2ep 峰值」结论 |
+| E5 纯 OPD 而非混合 | 隔离 teacher 信号 | ✅ E9p2 证明起点无关后，这个隔离更有价值 |
+| E2 手写 PRM | 补矩阵格 | ✅ 失败但必要——没有它就没有「PRM 必须数据驱动」 |
+| 转向 learned verifier | E2 失败后的 pivot | ✅ 方向正确（链路 bug 让验证迟到但基建全对）|
+| 评估加 LCB/CodeContests | 难度分层 | ✅ 只用简单题会得出完全错误的结论 |
+| 2ep 停早（E7 起）| 省钱先行验证 | ✅✅ 最正确的决定——4ep 是退化区 |
+| pin commit 0687ab61 | 担心口径漂移 | ❌ 错误决定（main 早已冻结），学费 = 一天下载折腾 |
+| 无卡预演方法论 | E7 七次崩溃的学费 | ✅ 第二项目直接复用 |
+| λ_v=0.1 结果主导 | 防黑客的保守默认 | ✅ RWOPD/PASS 论文事后背书 |
+| E9 三阶段设计 | 论文驱动（SeqBeatsJoint/GLM-5/RG-OPD）| ✅ 结构正确，负结果也成体系 |
+| 监控三件套 | 预算止损需求 | ✅ 崩了 7 次才凑齐，但齐了 |
+
