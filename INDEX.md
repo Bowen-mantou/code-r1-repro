@@ -11,6 +11,16 @@
 | [tutorials/CODE-WALKTHROUGH.md](tutorials/CODE-WALKTHROUGH.md) | **代码带读**：逐文件逐段精读 + 沙箱 harness + 复盘速记 | 9 章 |
 | [tutorials/VERIFIER-RGOPD-DEEP-DIVE.md](tutorials/VERIFIER-RGOPD-DEEP-DIVE.md) | **创新性内容**：verifier 设计空间/校准数学 + RG-OPD 四象限/失效分析/贡献点 | 3 章 |
 
+## 编号教学文档（对齐 search-r1-repro 结构）
+
+| 文档 | 用途 |
+|------|------|
+| [01-GPU-MEMORY-GUIDE.md](01-GPU-MEMORY-GUIDE.md) | 显存专项：账本算法 + 五类 OOM + 武器谱 + 观测工具箱 |
+| [03-CODE-数据与轨迹处理.md](03-CODE-数据与轨迹处理.md) | 数据管线：下载校验/坏行处置/口径冻结/断点续跑 |
+| [04-RL-METHODS-GUIDE.md](04-RL-METHODS-GUIDE.md) | RL 方法谱系推导：策略梯度→GRPO→k3→OPD→校准→门控 |
+| [06-veRL-导读.md](06-veRL-导读.md) | veRL 框架导读：角色/资源池/数据流/配置体系 |
+| [08-必背手册.md](08-必背手册.md) | 面试速记：一句话/数字表/公式/**口径纪律五条**/10 问答/简历模板 |
+
 ## 核心文档
 
 | 文档 | 用途 |
