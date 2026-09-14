@@ -74,7 +74,46 @@ Actor（训练对象）+ Critic（估计价值 V，算 advantage）
 Critic 是大头：多一个模型的多份显存。PPO 的 advantage 来自 GAE：
 `A_t = Σ (γλ)^l · (r + γV(s') − V(s))`——时序信用分配。
 
-### 1.2.3 GRPO：砍掉 Critic，用组内比较
+### 1.2.3 策略梯度的完整推导（三个魔法步骤）
+
+**步骤 1：似然比技巧（整个推导唯一的"魔法"）**
+```
+∇π_θ = π_θ · ∇log π_θ
+```
+概率的梯度 = 概率 × log 概率的梯度——把「对概率求导」变成「对 log 求导」，
+后者可以采样估计（MC 估计的根基）。
+
+**步骤 2：轨迹概率分解，log 把乘积变求和**
+```
+π(τ) = Π_t [p(s_{t+1}|s_t,a_t) · π_θ(a_t|s_t)]
+log π(τ) = Σ_t [log p(...) + log π_θ(a_t|s_t)]
+∇log π(τ) = Σ_t ∇log π_θ(a_t|s_t)     ← 环境项被求导消掉了
+```
+这一步的意义：**无模型**——不需要知道环境转移 p，梯度只依赖动作概率。
+
+**步骤 3：baseline 免费降方差**
+```
+E[∇log π · b] = b · ∇Σπ = b · ∇1 = 0     ← 任何 baseline 不改变期望
+但 Var(∇log π · (R−b)) < Var(∇log π · R)  ← 方差大降
+```
+最优 baseline = 奖励的条件期望（value function）——这是 PPO 用 critic 的理由，
+也是 GRPO 用组均值的理由（组均值是「免费的近似 baseline」）。
+
+### 1.2.4 PPO 的 clip：分区间梯度行为（面试加分点）
+
+```
+ratio r(θ) = π_θ / π_old
+L = min(r·Â, clip(r, 1±ε)·Â)   ε=0.2
+
+分区间表（Â>0 时）：
+  r < 1−ε：clip 活跃，梯度 = 0（离太远，不学也不反学）
+  1−ε ≤ r ≤ 1+ε：梯度 = Â（正常方向）
+  r > 1+ε：clip 活跃，梯度 = 0（已经推够远，停）
+```
+**软 clip 的妙处**：超界样本梯度为零——不是硬截断（不可导），也不是负梯度
+（推回）。「不学」比「反学」安全。
+
+### 1.2.5 GRPO：砍掉 Critic，用组内比较
 
 ```
 对每个 prompt 采样 G=4 个回答：
@@ -97,12 +136,30 @@ def grpo_loss(log_probs, old_log_probs, advantages, ref_log_probs):
     return pg_loss + beta * k3.mean()                 # + KL 惩罚
 ```
 
-### 1.2.4 GRPO 的两个重要细节（面试高频）
+**组归一化的三重数学意义**：
+| 机制 | 数学 | 直觉 |
+|------|------|------|
+| 组均值 baseline | E[∇·mean]=0 | 无偏降方差（1.2.3 步骤 3 的应用）|
+| 组 std 归一化 | 尺度不变 | 奖励 ×100 不改变梯度方向 |
+| 组内相对 | 排名信号 | 「比同组好」比「绝对值高」稳定 |
+
+**PPO vs GRPO 完整对照**：
+| | PPO | GRPO |
+|---|---|---|
+| advantage | GAE（需 critic）| 组内 z-score |
+| 模型数 | 4（actor/critic/ref/RM）| 3（actor/ref/RM）|
+| 显存 | critic 多 ~50% | 省 |
+| 长程适用 | ✅ GAE 时序信用分配 | ⚠️ 长度方差大时稀释 |
+| 我们的选择 | — | ✅（单轮 2048，中程适用）|
+
+### 1.2.6 GRPO 的两个重要细节（面试高频）
 
 1. **组归一化的代价**：轨迹长度差异大时 z-score 跨长度不公平——长轨迹的 token 级
    信用分配被稀释。**所以 GRPO 适合单轮/中程，长程 agent 建议 PPO+GAE**。
+   （本项目实证：Search-R1 长程 GRPO+LLDS 崩过；Code-R1 单轮 GRPO 稳。）
 2. **KL 的显存代价与缓解**：ref 模型 6GB + 前向激活——用 `param_offload`（换入换出
    用时间换空间）+ k3 单样本估计器（避开全词表 log_softmax 的 5.5GB）。
+   实测账：worker 峰值 58.6GB 已含 ref+KL，80G 卡放得下。
 
 ## 1.3 KL 散度与 k3 估计器（本项目数学核心）
 
@@ -121,6 +178,35 @@ def grpo_loss(log_probs, old_log_probs, advantages, ref_log_probs):
 | full | 全词表 | 显存爆炸（forward_kl_topk 场景）|
 
 **我们的选择**：全实验 k3——actor KL 与蒸馏 loss 同款，对照干净。
+
+### 1.3.3 k3 的无偏性证明（面试加分推导）
+
+```
+设 p、q 为采样 token 的 log 概率（q = ref 的 logprob）：
+k3 = e^(q−p) − (q−p) − 1
+
+在 Q 分布下取期望（D_KL(P∥Q) = E_P[log P/Q] 用 P 采样，但单样本估计器
+实际用的是「哪个分布采样到的 token 就算哪个」）：
+
+关键观察：f(x) = e^x − x − 1 是凸函数且在 x=0 处取值 0、导数 0。
+对 reverse KL 的估计（student 采样，即 P 下）：
+E_P[k3] = E_P[e^(q−p) − (q−p) − 1]
+        = E_P[q/p − 1] − E_P[log(q/p)] − 1 + E_P[p/q − ...]
+        ≈ D_KL(P∥Q)（χ² 型展开首项，E[q/p]−1 在 P 下 = 0 的修正项）
+
+直觉：k1 = log(p/q) 的方差来自 log 的尾部（q 很小时 log 爆炸）；
+k3 用 e^(q−p) 替代 log 的尾部——指数在 q−p→−∞ 时衰减到 0，
+把尾部方差压掉了。这就是「low_var」的来源。
+```
+
+### 1.3.4 为什么蒸馏也用 k3（方向与估计器的一体化）
+
+```
+蒸馏 loss = k3(student_logprob, teacher_logprob)
+= 单样本估计的 reverse KL（student 拉向 teacher）
+同一估计器同时服务「KL 惩罚（防漂移）」和「蒸馏（传知识）」——
+两个目的的数学工具统一，配置与对照都干净。
+```
 
 ## 1.4 OPD 蒸馏理论
 
@@ -164,13 +250,39 @@ def grpo_loss(log_probs, old_log_probs, advantages, ref_log_probs):
 分数：V_raw = Σ k·P(k) / 5   ∈ [0,1]
 ```
 
-### 1.6.2 两级校准（各管一个问题）
+### 1.6.2 两级校准的完整推导（各管一个问题）
 
+**Step 1 温度校准**（保序修尖锐度）：
 ```
-温度 T：P_T = softmax(logits/T)      → 保序修尖锐度
-Platt： V_cal = sigmoid(a·logitV + b) → 修偏移（b=10.33 = 模型系统性保守）
-ECE = 0.0067：「说 0.8 就是 80% 通过」
+P_T(k) = softmax(logits/T)
+T 的搜索目标：验证集 NLL = −Σ log P_T(k_true) 最小化
+T > 1 → 分布变平 → 修「过度自信」（LLM 通病）
+T 不改变 argmax → 保序（k 的排序不变）
 ```
+
+**Step 2 Platt 校准**（修偏移）：
+```
+先做 logit 变换：logit(V) = log(V/(1−V))   ← 把 [0,1] 拉满到 (−∞,+∞)
+再逻辑回归：    V_cal = 1/(1 + exp(−(a·logitV + b)))
+a、b 在验证集上最大似然拟合（两个参数）
+```
+**我们的 b=10.33 的解读**（面试能讲出含义）：
+b 大正 → sigmoid 输入整体右移 → **模型的 V_raw 系统性偏低**（保守的判卷老师）。
+Platt 把「保守的软分数」抬到「真实的通过率」——偏移修正是校准的核心，
+温度做不到这一点（温度只改尖锐度）。
+
+**Step 3 ECE 的完整计算示例**：
+```
+把验证样本按 V_cal 分 10 桶（[0,0.1), ..., [0.9,1]）
+每桶算：conf_b = 桶内 V_cal 均值；acc_b = 桶内真实正确率
+ECE = Σ_b (n_b/N) · |acc_b − conf_b|
+ECE = 0.0067：平均每桶的「说 vs 实际」差距 < 0.7 个百分点
+```
+
+**为什么校准是奖励信号的生命线**：
+RL 把 V_cal 当梯度方向——「说 0.8 实际 0.5」会让模型学错误的方向。
+**校准之后，verifier 的分数才有资格进奖励函数**——这是本项目 verifier 设计
+与其他「直接拿 logits 当奖励」做法最本质的区别。
 
 ### 1.6.3 奖励集成：结果主导 + 微塑形
 
@@ -191,12 +303,56 @@ g = I[(A>0 ∧ L_T>L_S+δ) ∨ (A≤0 ∧ L_T<L_S−δ)]
 **我们界定的边界条件**：自蒸馏（teacher=student）下 L_T−L_S 是数值噪声 → 随机砍半
 → 通过率 0.10-0.18 → 无增量。**前提：teacher 必须强于 student。**
 
+### 1.7.2 与相邻方法的公式对比（调研深度展示）
+
+| 方法 | 公式 | 粒度 |
+|------|------|------|
+| RG-OPD | `I[(A>0∧L_T>L_S) ∨ (A≤0∧L_T<L_S)]` | 轨迹级硬门 |
+| OPDVR | ReLU(±(L_T−L_S)) 由 verifier 定符号 | token 级软门 |
+| SG-OPD | `I[a₁(t)·a₂(t) > 0]`（token 级 sign 一致）| token 级 |
+| RWOPD | V^γ 连续权重 | 样本级软权 |
+| 无条件 OPD | 无门控 | — |
+
+**我们的实现位置**：RG-OPD 轨迹级硬门（veRL low_var_kl loss 内）——
+选它是因为与「verifier 校准分数 >0.5 即方向」的语义最贴合。
+
+### 1.7.3 门控的失败机制完整分析（三层）
+
+```
+层 1（根因）：teacher=student → L_T−L_S = 浮点噪声 → 「teacher 更确信」无语义
+层 2（放大）：通过率 = P(V>0.5) × P(噪声方向对) ≈ 25% × 50% ≈ 12%
+           → 每批 1-2 条有效轨迹，梯度噪声淹没信号
+层 3（环境）：E9p2 已在 25.2 收敛带 → 蒸馏拉向「昨天的自己」只会偏离
+```
+三层缺一不可地解释了 24.8 的微降——面试时按这个顺序讲，逻辑完整。
+
 ## 1.8 训练稳定性：2ep 峰值与 4ep 退化
 
 ```
 E1（4ep/944 步）→ LCB 19.8：GRPO 过训 = entropy collapse（策略坍缩到少数模板）
 E7（2ep/446 步）→ LCB 25.2：恰好停在峰值
 ```
+
+### 1.8.1 entropy collapse 的机制
+
+```
+RL 优化过程 = 对高奖励输出的「正反馈循环」
+后期：少量高奖励模板的生成概率被无限推高 → 策略熵 → 0
+表现：输出多样性死亡（千题一面）、泛化崩（验证集过拟合奖励模式）
+证据链：E1 的 HumanEval 86.6 冠军 vs LCB 19.8 垫底——简单题模式被
+      过拟合，竞赛题全崩
+```
+
+### 1.8.2 防御手段谱系
+
+| 手段 | 机制 | 我们用了吗 |
+|------|------|-----------|
+| KL 惩罚 β=0.001 | 拖住策略不远离 ref（熵的下界）| ✅ |
+| 2ep 停早 | 在坍缩前收手 | ✅（运气+经验）|
+| 验证曲线监控 | 峰值定位 | ❌（短板，已入 PITFALLS）|
+| 熵正则项 | 显式奖励多样性 | ❌ |
+| 蒸馏 reheating | 坍缩后恢复（TS-OPSD）| ❌（未来工作）|
+
 **机制**（文献呼应 TS-OPSD 2606.00755）：RL 后期策略熵坍缩，多样性死亡，泛化崩。
 **经验**：GRPO 训练必须配验证集曲线监控，2ep 是安全默认。
 
@@ -288,8 +444,44 @@ except subprocess.TimeoutExpired:
 阶段 2：800 题装箱（FFD 贪心，ratio≤1.5，batch≤8）+ 动态 max_new
 撞顶检测：gen 长度 == max_new → 单独 2048 重跑（口径保证）
 ```
-**诚实结论**：真实中位数 128 token → 744/800 撞顶重跑 → 与串行打平。
-**教训**：模拟验证调度正确 ≠ 吞吐快，时间优化先跑 20 题实测。
+
+### 装箱调度的完整代码（带读）
+
+```python
+def schedule(items, est, default=1024):
+    # FFD（first-fit decreasing）：大件先装，找能容纳的批
+    scored = sorted(items, key=lambda x: est.get(x[0], default), reverse=True)
+    batches = []
+    for item in scored:
+        e = est.get(item[0], default)
+        placed = False
+        for batch in batches:
+            be = est.get(batch[0][0], default)
+            # ratio≤1.5：批内最长/最短 ≤1.5 —— 木桶浪费上限 33%
+            if len(batch) < BATCH_MAX and max(be, e) <= min(be, e) * RATIO:
+                batch.append(item); placed = True; break
+        if not placed:
+            batches.append([item])     # 开新批
+    return batches
+```
+**三个设计点的「为什么」**：
+- 降序排序（FD）：大件先装，装箱经典启发式（FFD 是近似最优的）
+- RATIO=1.5：批内长度差上限——最长题决定整批时长，ratio 1.5 = 最坏 33% padding 浪费
+- default=中位数：无先验题的估计——分布最稳健的单点
+
+### 撞顶重跑：口径保证的关键
+
+```python
+hit_cap = gen.shape[0] >= max_new       # 生成长度顶到上限 = 可能截断
+if hit_cap:
+    text, _ = gen_one(model, tok, prompt)  # 单独 2048 重跑（与串行逐 token 一致）
+```
+**为什么这个 if 值回票价**：动态上限的批量生成若截断了某题，那道题的结果与
+「串行 2048 评估」不一致 → E9p2 与 E7 的分数不可比。**优化可以打折扣，口径不能**。
+
+**诚实结论**：真实中位数 128 token → 动态上限 256 → 744/800 撞顶重跑 → 总时长
+与串行打平（75 vs 80 分钟）。**教训**：模拟验证了调度正确性（111 批完美装箱），
+没验证真实长度分布——时间优化先跑 20 题实测。
 
 ## 2.6 my_lcb_eval.py：官方口径打分
 
