@@ -218,12 +218,30 @@ k3 用 e^(q−p) 替代 log 的尾部——指数在 q−p→−∞ 时衰减到
 | 信号 | CE loss | 逐 token KL（teacher logprob）|
 | 纠错位置 | 静态数据集 | on-policy 分布（无 exposure bias）|
 
-### 1.4.2 KL 方向：为什么 reverse
+### 1.4.2 KL 方向：为什么 reverse（数学直觉）
 
-- forward KL：mode-covering——学 teacher 全部模式含错误
-- reverse KL：mode-seeking——只追 teacher 高概率区
-- OPD 用 reverse：**「只学 teacher 确信的东西」**——我们 low_var_kl 就是 reverse KL
-  的单样本估计。
+```
+forward KL: D_KL(Q∥P) = E_Q[log Q/P]   Q=teacher
+  → 惩罚「teacher 高概率但 student 低概率」的区域
+  → mode-covering：student 必须覆盖 teacher 的所有模式（含错误模式）
+  → 「宁可全学，不可漏学」
+
+reverse KL: D_KL(P∥Q) = E_P[log P/Q]   P=student
+  → 惩罚「student 高概率但 teacher 低概率」的区域
+  → mode-seeking：student 只在 teacher 高概率区活动
+  → 「宁可少学，不可学错」
+```
+**数值上的选择理由**：teacher（7B 基模）的模式里有大量「正确率低但概率高」的解
+——forward KL 会把它们全学进来（E5 时代担心的「盲蒸馏」）；reverse KL 天然只追
+高置信区。这就是 OPD 用 reverse 的动机，也是「为什么蒸馏 loss 的 student 在前」。
+
+### 1.4.3 GLM-5 的 advantage 形式（蒸馏与 RL 统一）
+
+`Â_t = sg[log π_teacher − log π_student]`——teacher 更确信的 token 得正优势。
+与 GRPO 同构：蒸馏信号直接进 policy gradient 管线。
+**推导视角**：这不是新公式，而是 reverse KL 的「一阶化」——
+把逐 token 的 KL 惩罚改写成 advantage 项，就能与任意 advantage 估计器
+（GRPO/PPO）相加，实现「蒸馏与 RL 一个引擎」。
 
 ### 1.4.3 GLM-5 的 advantage 形式（蒸馏与 RL 统一）
 
@@ -249,6 +267,18 @@ k3 用 e^(q−p) 替代 log 的尾部——指数在 q−p→−∞ 时衰减到
 输出：P(k) = softmax(logits[digit_ids])   k∈{0..5}
 分数：V_raw = Σ k·P(k) / 5   ∈ [0,1]
 ```
+
+**数据构造的完整闭环（零人工标注）**：
+```
+1. 采样 (题目, 代码) 对——代码来自各实验模型的 rollout（分布多样，
+   不是单一模型的自产自销）
+2. 沙箱执行：对每题的子测试集分别跑 → 真实 k（通过数）
+3. 「子集 k/N」标注：只跑 5 个测试中的部分子集，k = 子集通过数
+   → 覆盖「部分正确」的中间态（比二分类多 4 倍梯度信息）
+4. 标签平衡：正确/错误/中间态混合采样，防类别坍缩
+```
+**设计选择**：为什么 0-5 而不是 0-100——粒度与可标注性的平衡：
+5 个测试的通过数天然可测（不用人定「73 分 vs 74 分」的界线）。
 
 ### 1.6.2 两级校准的完整推导（各管一个问题）
 
@@ -376,6 +406,18 @@ def compute_score(data_source, solution_str, ground_truth, extra_info,
     return result_bin
 ```
 
+### 沙箱执行的内部（execute_passes_tests 展开）
+
+```python
+def execute_passes_tests(solution_str, ground_truth):
+    # 拼接：solution + 官方测试用例 → 一个可执行文件
+    code = solution_str + "\n" + ground_truth["test_code"]
+    succ, stdout = firejail_exec.code_exec_firejail(code, timeout=30)
+    return succ    # 测试全过 → True
+```
+**设计**：测试代码作为 ground truth 的一部分拼在解法后——执行即验证，
+零手工判分。timeout 30s（沙箱内还有 RLIMIT_CPU 30s 内核兜底，双保险）。
+
 **三个带教点**：
 1. **双层读取的代价**：`get` 读不到时静默 fallback——这是链路 bug 的土壤。
    更好的写法是读不到就 raise 或启动 smoke 打印。
@@ -384,15 +426,52 @@ def compute_score(data_source, solution_str, ground_truth, extra_info,
 
 ## 2.2 verifier_server.py：Ray 单例 + 攒批（~140 行）
 
-### 推理路径
+### 完整推理类（VerifierInference 核心）
+
 ```python
-last_pos = enc["attention_mask"].sum(dim=1) - 1      # 最后一个有效 token
-logits = out.logits[torch.arange(len(texts)), last_pos]
-digit_logits = logits[:, self.digit_ids]             # (B,6) 只取 "0".."5"
-probs = softmax(digit_logits)
-v_raw = (probs * arange(6)).sum(-1) / 5              # 期望值而非 argmax
-v_cal = sigmoid(a * logit(v_raw) + b)                # Platt
+class VerifierInference:
+    def __init__(self, model_path, calibration_path=None, device="cuda"):
+        self.tok = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_path, torch_dtype=torch.bfloat16, trust_remote_code=True).to(device)
+        self.model.eval()
+        self.digit_ids = self.tok.convert_tokens_to_ids(["0","1","2","3","4","5"])
+        # 校准参数（Platt）
+        self.a, self.b = 1.0, 0.0
+        if calibration_path and os.path.exists(calibration_path):
+            cal = json.load(open(calibration_path))
+            self.a, self.b = cal["platt_coef"], cal["platt_intercept"]
+
+    def build_inputs(self, prompts, codes):
+        texts = [f"{truncate_prompt(p)}\n\n```python\n{truncate_code(c)}\n```\n\n{INSTR}"
+                 for p, c in zip(prompts, codes)]
+        return texts   # INSTR = "这段代码能通过几个测试用例？只回答一个数字 (0-5)。"
+
+    @torch.no_grad()
+    def score_batch(self, prompts, codes):
+        texts = self.build_inputs(prompts, codes)
+        enc = self.tok(texts, truncation=True, max_length=4096,
+                       padding=True, return_tensors="pt").to(self.device)
+        out = self.model(**enc, use_cache=False)      # 单步推理，不要 KV cache
+        last_pos = enc["attention_mask"].sum(dim=1) - 1   # 最后有效 token（padding 防坑）
+        logits = out.logits[torch.arange(len(texts)), last_pos]
+        digit_logits = logits[:, self.digit_ids]      # (B,6) 只取 "0".."5"
+        probs = torch.softmax(digit_logits.float(), dim=-1)
+        e_k = (probs * torch.arange(6, device=self.device)).sum(dim=-1)
+        v_raw = (e_k / 5.0).cpu().numpy()             # 期望值而非 argmax
+        eps = 1e-6
+        logit_v = [math.log(max(v, eps)/max(1-v, eps)) for v in v_raw]
+        v_cal = [1/(1 + math.exp(-(self.a*lv + self.b))) for lv in logit_v]
+        return v_cal
 ```
+
+**逐行带教**：
+- `use_cache=False`：只取最后位置 logits、不生成——KV cache 无用且占显存
+- `attention_mask.sum(-1) - 1`：batch 内长度不同时，naive 的 `logits[:,-1]` 会取到
+  pad token 的垃圾输出——**batch 推理第一坑**
+- `digit_logits = logits[:, digit_ids]`：先切 6 维再 softmax——省 15 万维 softmax
+- 期望值：V=0.73 携带「部分正确」的梯度信息，硬 argmax 只有 0/1
+- eps clamp：log(0) 保护（V=0 或 1 的极端样本）
 
 ### 攒批 worker（本项目最精妙的并发设计）
 ```python
@@ -412,18 +491,45 @@ def _worker(self):
 ## 2.3 sandbox_exec.py：seccomp BPF 手写（91 行）
 
 ```python
-BLOCKED_NRS = [41..55]                    # x86_64 socket 家族 syscall
+BLOCKED_NRS = [41,42,43,44,45,46,47,48,49,50,51,52,53,54,55]  # x86_64 socket 家族
 def build_filter():
-    f = [_f(0x20, 0, 0, 4),               # LD W ABS 4（读 arch）
-         _f(0x15, 1, 0, AUDIT_ARCH_X86_64),  # arch 检查（安全第一行）
-         _f(0x06, 0, 0, KILL_PROCESS),    # 非 x86_64 直接杀
+    f = [_f(0x20, 0, 0, 4),               # LD W ABS 4：加载 arch 字段
+         _f(0x15, 1, 0, AUDIT_ARCH_X86_64),  # JEQ arch==x86_64？是→跳 1 格（jt=1）
+         _f(0x06, 0, 0, KILL_PROCESS),    # 否 → 直接杀（异架构 syscall 号不可信）
          _f(0x20, 0, 0, 0)]               # LD syscall nr
     for nr in BLOCKED_NRS:
-        f += [_f(0x15, 0, 1, nr), _f(0x06, 0, 0, ERRNO|1)]  # EPERM（可诊断）
-    f.append(_f(0x06, 0, 0, ALLOW))
+        f.append(_f(0x15, 0, 1, nr))      # JEQ nr==blocked？是→不跳（jf=0 落下一行）
+        f.append(_f(0x06, 0, 0, ERRNO|1)) # RET EPERM（可诊断：socket() 返回权限错误）
+    f.append(_f(0x06, 0, 0, ALLOW))       # 其余全放行
 ```
-RLIMIT 全家桶（NPROC 32/NOFILE 32/FSIZE 2MB/AS 4GB/**CPU 30s 内核强制**）
-+ setuid nobody（先 NO_NEW_PRIVS 再 seccomp）+ **execvp 原子替换**（无 fork 窗口）。
+
+**BPF 字节码的三条指令**（面试能讲）：
+- `LD W ABS n`：从 seccomp_data 结构第 n 个字加载（0=syscall 号、1=参数1、4=arch）
+- `JEQ val jt jf`：等于 val 则跳 jt 格，否则跳 jf 格——线性程序的控制流就是跳格
+- `RET val`：返回动作（ALLOW / ERRNO(EPERM) / KILL）
+
+**两个安全设计点的「为什么」**：
+1. **arch 检查第一行**：x86 的 41 号在 arm 上是别的调用——不检查会堵错 syscall。
+   安全第一 pattern：先验身份再验行为。
+2. **EPERM 而非 KILL**：让模型代码看到「网络不可用」的正常错误而非进程暴毙——
+   可诊断性优于暴力（测试会报 socket 错误，一眼定位）。
+
+```python
+def apply_rlimits():
+    RLIMIT_NPROC 32      # 防 fork 炸弹（进程数上限）
+    RLIMIT_NOFILE 32     # 防 fd 耗尽
+    RLIMIT_FSIZE 2MB     # 防写盘（输出文件上限）
+    RLIMIT_AS 4GB        # 防内存炸弹（地址空间上限）
+    RLIMIT_CPU 30        # 防死循环——内核强制 SIGXCPU，孙进程逃不掉
+def drop_privs():
+    os.setgroups([])     # 清附加组（提权漏洞高发区）
+    os.setgid(65534); os.setuid(65534)   # nobody
+def main():
+    apply_rlimits(); apply_seccomp(); drop_privs()
+    os.execvp(sys.argv[1], sys.argv[1:])  # 原子替换——无 fork 窗口期
+```
+**四层纵深总结**：seccomp（堵网络）→ rlimit（限资源，CPU 内核强制）→
+setuid（降权）→ execvp（原子性）。每层对应一类攻击，面试逐层讲。
 
 ## 2.4 firejail_exec.py：进程组超时（103 行）
 
